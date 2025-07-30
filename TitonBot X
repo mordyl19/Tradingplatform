@@ -7,7 +7,10 @@ import schedule
 import time
 import json
 import os
-from datetime import datetime
+import signal
+import sys
+from datetime import datetime, timedelta
+import traceback
 
 # === CONFIGURATION ===
 ACCOUNT_CASH_BUFFER = 0.05  # preserve 5% cash
@@ -18,155 +21,609 @@ TRAIL_STOP_PCT = 0.03       # 3% trailing stop
 VOL_MULTIPLIER = 1.5        # volatility target multiplier
 MEMORY_FILE = "strategy_history.json"
 TRADE_LOG_FILE = "trade_log.csv"
+BOT_LOG_FILE = "titanbot.log"
 
-# === CONNECT TO IB ===
-ib = IB()
-ib.connect('127.0.0.1', 7497, clientId=1)
+# Global variables
+ib = None
+daily_pnl = 0.0
+start_balance = 0.0
+active_positions = {}
+shutdown_flag = False
+
+# === SIGNAL HANDLERS ===
+def signal_handler(sig, frame):
+    global shutdown_flag
+    log("Shutdown signal received. Closing positions and exiting...")
+    shutdown_flag = True
+    cleanup_and_exit()
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 # === HELPER FUNCTIONS ===
 def log(msg):
-    with open("titanbot.log", "a") as f:
-        f.write(f"[{datetime.now()}] {msg}\n")
-    print(msg)
+    """Thread-safe logging with error handling"""
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_msg = f"[{timestamp}] {msg}"
+        
+        # Write to file
+        with open(BOT_LOG_FILE, "a") as f:
+            f.write(log_msg + "\n")
+        
+        # Print to console
+        print(log_msg)
+    except Exception as e:
+        print(f"Logging error: {e}")
+
+def connect_ib():
+    """Establish connection to Interactive Brokers with retry logic"""
+    global ib
+    max_retries = 3
+    retry_delay = 5
+    
+    for attempt in range(max_retries):
+        try:
+            if ib is not None:
+                ib.disconnect()
+            
+            ib = IB()
+            ib.connect('127.0.0.1', 7497, clientId=1)
+            log("Successfully connected to Interactive Brokers")
+            return True
+            
+        except Exception as e:
+            log(f"Connection attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+            else:
+                log("Failed to connect after all attempts")
+                return False
+    
+    return False
 
 def get_account_balance():
-    account_summary = ib.accountSummary()
-    net_liquidation = float(account_summary.loc['NetLiquidation', 'value'])
-    return net_liquidation
+    """Get account balance with proper error handling"""
+    try:
+        if not ib or not ib.isConnected():
+            if not connect_ib():
+                return 0.0
+        
+        account_summary = ib.accountSummary()
+        
+        # Find NetLiquidation value
+        for item in account_summary:
+            if item.tag == 'NetLiquidation':
+                return float(item.value)
+        
+        log("NetLiquidation not found in account summary")
+        return 0.0
+        
+    except Exception as e:
+        log(f"Error getting account balance: {e}")
+        return 0.0
+
+def get_available_funds():
+    """Get available funds for trading"""
+    try:
+        if not ib or not ib.isConnected():
+            return 0.0
+        
+        account_summary = ib.accountSummary()
+        
+        for item in account_summary:
+            if item.tag == 'AvailableFunds':
+                return float(item.value)
+        
+        return 0.0
+        
+    except Exception as e:
+        log(f"Error getting available funds: {e}")
+        return 0.0
+
+def check_daily_loss_limit():
+    """Check if daily loss limit has been reached"""
+    global daily_pnl, start_balance
+    
+    if start_balance <= 0:
+        return False
+    
+    daily_return = daily_pnl / start_balance
+    if daily_return <= DAILY_LOSS_LIMIT:
+        log(f"Daily loss limit reached: {daily_return:.2%}")
+        return True
+    
+    return False
 
 def load_memory():
-    if os.path.exists(MEMORY_FILE):
-        with open(MEMORY_FILE, 'r') as f:
-            return json.load(f)
+    """Load strategy memory with error handling"""
+    try:
+        if os.path.exists(MEMORY_FILE):
+            with open(MEMORY_FILE, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        log(f"Error loading memory: {e}")
+    
     return {}
 
 def save_memory(memory):
-    with open(MEMORY_FILE, 'w') as f:
-        json.dump(memory, f, indent=2)
+    """Save strategy memory with error handling"""
+    try:
+        with open(MEMORY_FILE, 'w') as f:
+            json.dump(memory, f, indent=2)
+    except Exception as e:
+        log(f"Error saving memory: {e}")
 
 def adaptive_learning(symbol, pnl):
-    memory = load_memory()
-    if symbol not in memory:
-        memory[symbol] = {"count": 0, "total_return": 0}
-    memory[symbol]["count"] += 1
-    memory[symbol]["total_return"] += pnl
-    save_memory(memory)
+    """Update strategy memory based on trade results"""
+    try:
+        memory = load_memory()
+        if symbol not in memory:
+            memory[symbol] = {"count": 0, "total_return": 0, "win_rate": 0.0, "wins": 0}
+        
+        memory[symbol]["count"] += 1
+        memory[symbol]["total_return"] += pnl
+        
+        if pnl > 0:
+            memory[symbol]["wins"] += 1
+        
+        memory[symbol]["win_rate"] = memory[symbol]["wins"] / memory[symbol]["count"]
+        save_memory(memory)
+        
+    except Exception as e:
+        log(f"Error in adaptive learning: {e}")
 
 def evaluate_trade(symbol):
-    memory = load_memory()
-    stats = memory.get(symbol, {"count": 0, "total_return": 0})
-    if stats["count"] >= 3 and (stats["total_return"] / stats["count"]) < 0:
+    """Evaluate if we should trade this symbol based on historical performance"""
+    try:
+        memory = load_memory()
+        stats = memory.get(symbol, {"count": 0, "total_return": 0, "win_rate": 0.0})
+        
+        # Skip if we have enough data and poor performance
+        if stats["count"] >= 5:
+            avg_return = stats["total_return"] / stats["count"]
+            win_rate = stats.get("win_rate", 0.0)
+            
+            if avg_return < -0.01 or win_rate < 0.3:  # Less than 30% win rate
+                log(f"Skipping {symbol} due to poor historical performance")
+                return False
+        
+        return True
+        
+    except Exception as e:
+        log(f"Error evaluating trade for {symbol}: {e}")
         return False
-    return True
 
 def record_trade(symbol, qty, entry, exit, pnl, result):
-    with open(TRADE_LOG_FILE, 'a') as f:
-        f.write(f"{datetime.now()},{symbol},{qty},{entry},{exit},{pnl},{result}\n")
+    """Record trade details with error handling"""
+    try:
+        # Create header if file doesn't exist
+        if not os.path.exists(TRADE_LOG_FILE):
+            with open(TRADE_LOG_FILE, 'w') as f:
+                f.write("timestamp,symbol,quantity,entry_price,exit_price,pnl,result\n")
+        
+        with open(TRADE_LOG_FILE, 'a') as f:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"{timestamp},{symbol},{qty},{entry},{exit},{pnl},{result}\n")
+            
+    except Exception as e:
+        log(f"Error recording trade: {e}")
 
 # === MARKET FUNCTIONS ===
 def get_market_data(symbol):
-    contract = Stock(symbol, 'SMART', 'USD')
-    ib.qualifyContracts(contract)
-    bars = ib.reqHistoricalData(
-        contract,
-        endDateTime='',
-        durationStr='5 D',
-        barSizeSetting='5 mins',
-        whatToShow='TRADES',
-        useRTH=True,
-        formatDate=1
-    )
-    df = util.df(bars)
-    return df
+    """Get historical market data with error handling"""
+    try:
+        if not ib or not ib.isConnected():
+            if not connect_ib():
+                return None
+        
+        contract = Stock(symbol, 'SMART', 'USD')
+        ib.qualifyContracts(contract)
+        
+        if not contract.conId:
+            log(f"Failed to qualify contract for {symbol}")
+            return None
+        
+        bars = ib.reqHistoricalData(
+            contract,
+            endDateTime='',
+            durationStr='5 D',
+            barSizeSetting='5 mins',
+            whatToShow='TRADES',
+            useRTH=True,
+            formatDate=1
+        )
+        
+        if not bars:
+            log(f"No historical data received for {symbol}")
+            return None
+        
+        df = util.df(bars)
+        return df
+        
+    except Exception as e:
+        log(f"Error getting market data for {symbol}: {e}")
+        return None
 
 def calculate_volatility(df):
-    return df['close'].pct_change().std()
+    """Calculate volatility with error handling"""
+    try:
+        if df is None or len(df) < 2:
+            return 0.0
+        
+        returns = df['close'].pct_change().dropna()
+        if len(returns) < 2:
+            return 0.0
+            
+        return returns.std()
+        
+    except Exception as e:
+        log(f"Error calculating volatility: {e}")
+        return 0.0
+
+def get_current_price(symbol):
+    """Get current market price"""
+    try:
+        if not ib or not ib.isConnected():
+            return None
+        
+        contract = Stock(symbol, 'SMART', 'USD')
+        ib.qualifyContracts(contract)
+        
+        ticker = ib.reqMktData(contract, '', False, False)
+        ib.sleep(2)  # Wait for data
+        
+        # Try different price sources
+        if ticker.last and ticker.last > 0:
+            return ticker.last
+        elif ticker.bid and ticker.ask:
+            return (ticker.bid + ticker.ask) / 2
+        else:
+            return None
+            
+    except Exception as e:
+        log(f"Error getting current price for {symbol}: {e}")
+        return None
+    finally:
+        try:
+            ib.cancelMktData(contract)
+        except:
+            pass
 
 def get_signal(symbol):
-    df = get_market_data(symbol)
-    if df is None or len(df) < 10:
+    """Generate trading signal with improved logic"""
+    try:
+        df = get_market_data(symbol)
+        if df is None or len(df) < 20:
+            return False
+        
+        # Simple momentum strategy
+        current_price = df['close'].iloc[-1]
+        sma_10 = df['close'].rolling(10).mean().iloc[-1]
+        sma_20 = df['close'].rolling(20).mean().iloc[-1]
+        
+        # Volume confirmation
+        avg_volume = df['volume'].rolling(10).mean().iloc[-1]
+        current_volume = df['volume'].iloc[-1]
+        
+        # Signal conditions
+        momentum_signal = current_price > sma_10 > sma_20
+        volume_confirmation = current_volume > avg_volume * 1.2
+        
+        return momentum_signal and volume_confirmation
+        
+    except Exception as e:
+        log(f"Error generating signal for {symbol}: {e}")
         return False
-    momentum = df['close'].iloc[-1] > df['close'].rolling(10).mean().iloc[-1]
-    return momentum
 
 # === TRADE EXECUTION ===
+def calculate_position_size(symbol, balance):
+    """Calculate appropriate position size"""
+    try:
+        current_price = get_current_price(symbol)
+        if not current_price or current_price <= 0:
+            return 0
+        
+        # Calculate trade value
+        trade_value = balance * TRADE_SIZE_FRACTION
+        
+        # Calculate number of shares
+        shares = int(trade_value / current_price)
+        
+        # Ensure we don't exceed available funds
+        available_funds = get_available_funds()
+        max_shares = int((available_funds * (1 - ACCOUNT_CASH_BUFFER)) / current_price)
+        
+        return min(shares, max_shares)
+        
+    except Exception as e:
+        log(f"Error calculating position size for {symbol}: {e}")
+        return 0
+
 def place_order(symbol, qty):
-    contract = Stock(symbol, 'SMART', 'USD')
-    ib.qualifyContracts(contract)
-    order = MarketOrder('BUY', qty)
-    trade = ib.placeOrder(contract, order)
-    ib.sleep(5)
-    return trade
+    """Place market order with proper error handling"""
+    try:
+        if qty <= 0:
+            log(f"Invalid quantity for {symbol}: {qty}")
+            return None
+        
+        if not ib or not ib.isConnected():
+            if not connect_ib():
+                return None
+        
+        contract = Stock(symbol, 'SMART', 'USD')
+        ib.qualifyContracts(contract)
+        
+        if not contract.conId:
+            log(f"Failed to qualify contract for {symbol}")
+            return None
+        
+        order = MarketOrder('BUY', qty)
+        trade = ib.placeOrder(contract, order)
+        
+        # Wait for order to fill
+        max_wait = 30  # seconds
+        start_time = time.time()
+        
+        while time.time() - start_time < max_wait:
+            ib.sleep(1)
+            if trade.orderStatus.status in ['Filled', 'Cancelled']:
+                break
+        
+        if trade.orderStatus.status != 'Filled':
+            log(f"Order for {symbol} not filled: {trade.orderStatus.status}")
+            ib.cancelOrder(order)
+            return None
+        
+        log(f"Successfully bought {qty} shares of {symbol} at {trade.orderStatus.avgFillPrice}")
+        return trade
+        
+    except Exception as e:
+        log(f"Error placing order for {symbol}: {e}")
+        return None
 
 def live_exit(symbol, qty, entry_price):
-    contract = Stock(symbol, 'SMART', 'USD')
-    ib.qualifyContracts(contract)
-    max_price = entry_price
-    start_time = time.time()
-    hold_seconds = DEFAULT_HOLD_MINUTES * 60
-    df = get_market_data(symbol)
-    vol = calculate_volatility(df)
-    exit_price = entry_price
-
-    while time.time() - start_time < hold_seconds:
-        ticker = ib.reqMktData(contract, '', False, False)
-        ib.sleep(5)
-        current_price = ticker.marketPrice()
-        max_price = max(max_price, current_price)
-        drawdown = (max_price - current_price) / max_price
-        price_change = (current_price - entry_price)
-        exit_price = current_price
-
-        if drawdown >= TRAIL_STOP_PCT:
-            break
-        if price_change >= VOL_MULTIPLIER * vol * entry_price:
-            break
-
-    sell_order = MarketOrder('SELL', qty)
-    ib.placeOrder(contract, sell_order)
-    ib.sleep(3)
-    return exit_price
+    """Execute exit strategy with trailing stop and time limit"""
+    try:
+        if not ib or not ib.isConnected():
+            return entry_price
+        
+        contract = Stock(symbol, 'SMART', 'USD')
+        ib.qualifyContracts(contract)
+        
+        max_price = entry_price
+        start_time = time.time()
+        hold_seconds = DEFAULT_HOLD_MINUTES * 60
+        
+        # Get volatility for dynamic exit
+        df = get_market_data(symbol)
+        vol = calculate_volatility(df)
+        
+        log(f"Starting exit monitoring for {symbol}, entry: {entry_price}")
+        
+        while time.time() - start_time < hold_seconds:
+            if shutdown_flag:
+                break
+                
+            current_price = get_current_price(symbol)
+            if not current_price:
+                ib.sleep(5)
+                continue
+            
+            max_price = max(max_price, current_price)
+            drawdown = (max_price - current_price) / max_price if max_price > 0 else 0
+            profit_pct = (current_price - entry_price) / entry_price if entry_price > 0 else 0
+            
+            # Exit conditions
+            if drawdown >= TRAIL_STOP_PCT:
+                log(f"Trailing stop triggered for {symbol}: {drawdown:.2%} drawdown")
+                break
+                
+            if vol > 0 and profit_pct >= VOL_MULTIPLIER * vol:
+                log(f"Profit target reached for {symbol}: {profit_pct:.2%}")
+                break
+            
+            ib.sleep(5)
+        
+        # Place sell order
+        sell_order = MarketOrder('SELL', qty)
+        sell_trade = ib.placeOrder(contract, sell_order)
+        
+        # Wait for sell order to fill
+        max_wait = 30
+        start_time = time.time()
+        
+        while time.time() - start_time < max_wait:
+            ib.sleep(1)
+            if sell_trade.orderStatus.status in ['Filled', 'Cancelled']:
+                break
+        
+        if sell_trade.orderStatus.status == 'Filled':
+            exit_price = sell_trade.orderStatus.avgFillPrice
+            log(f"Successfully sold {qty} shares of {symbol} at {exit_price}")
+            return exit_price
+        else:
+            log(f"Sell order for {symbol} not filled: {sell_trade.orderStatus.status}")
+            return current_price or entry_price
+            
+    except Exception as e:
+        log(f"Error in live exit for {symbol}: {e}")
+        return entry_price
 
 # === CORE STRATEGY ===
 def run_trading_day():
-    log("Starting TitanBot trading session...")
-    balance = get_account_balance()
-    if balance <= 0:
-        log("No available balance.")
-        return
+    """Execute daily trading strategy with comprehensive error handling"""
+    global daily_pnl, start_balance
+    
+    try:
+        log("Starting TitanBot trading session...")
+        
+        # Initialize daily tracking
+        if start_balance == 0:
+            start_balance = get_account_balance()
+            daily_pnl = 0.0
+        
+        # Check daily loss limit
+        if check_daily_loss_limit():
+            log("Daily loss limit reached. Skipping trading.")
+            return
+        
+        balance = get_account_balance()
+        if balance <= 1000:  # Minimum balance check
+            log(f"Insufficient balance for trading: ${balance}")
+            return
+        
+        available_funds = get_available_funds()
+        if available_funds <= 100:
+            log(f"Insufficient available funds: ${available_funds}")
+            return
+        
+        # Trading symbols
+        tickers = ["SPY", "QQQ", "TQQQ", "TSLA", "NVDA"]
+        trades_executed = 0
+        max_trades_per_day = 3
+        
+        for symbol in tickers:
+            if shutdown_flag or trades_executed >= max_trades_per_day:
+                break
+                
+            try:
+                # Check if we should trade this symbol
+                if not get_signal(symbol):
+                    log(f"No signal for {symbol}")
+                    continue
+                    
+                if not evaluate_trade(symbol):
+                    log(f"Skipping {symbol} based on historical performance")
+                    continue
+                
+                # Calculate position size
+                qty = calculate_position_size(symbol, balance)
+                if qty <= 0:
+                    log(f"Invalid position size for {symbol}: {qty}")
+                    continue
+                
+                # Place entry order
+                trade = place_order(symbol, qty)
+                if not trade:
+                    continue
+                
+                entry_price = trade.orderStatus.avgFillPrice
+                if not entry_price or entry_price <= 0:
+                    log(f"Invalid entry price for {symbol}: {entry_price}")
+                    continue
+                
+                # Execute exit strategy
+                exit_price = live_exit(symbol, qty, entry_price)
+                
+                # Calculate results
+                pnl = (exit_price - entry_price) * qty
+                pnl_pct = (exit_price - entry_price) / entry_price if entry_price > 0 else 0
+                result = "win" if pnl > 0 else "loss"
+                
+                # Update tracking
+                daily_pnl += pnl
+                trades_executed += 1
+                
+                # Record trade
+                record_trade(symbol, qty, entry_price, exit_price, pnl, result)
+                adaptive_learning(symbol, pnl_pct)
+                
+                log(f"{symbol} trade completed: {result}, PnL: ${pnl:.2f} ({pnl_pct:.2%})")
+                
+                # Brief pause between trades
+                time.sleep(10)
+                
+            except Exception as e:
+                log(f"Error trading {symbol}: {e}")
+                continue
+        
+        # Session summary
+        current_balance = get_account_balance()
+        session_pnl = current_balance - balance
+        log(f"Trading session completed. Trades: {trades_executed}, Session PnL: ${session_pnl:.2f}")
+        
+    except Exception as e:
+        log(f"Error in trading session: {e}")
+        log(f"Traceback: {traceback.format_exc()}")
 
-    tickers = ["SPY", "QQQ", "TQQQ", "TSLA", "NVDA"]
-    for symbol in tickers:
-        if not get_signal(symbol):
-            continue
-        if not evaluate_trade(symbol):
-            continue
-
-        size = int((balance * TRADE_SIZE_FRACTION) // 100)
-        trade = place_order(symbol, size)
-        entry_price = trade.orderStatus.avgFillPrice or 0
-        if entry_price <= 0:
-            log(f"Failed entry price for {symbol}.")
-            continue
-
-        exit_price = live_exit(symbol, size, entry_price)
-        pnl = exit_price - entry_price
-        result = "win" if pnl > 0 else "loss"
-        record_trade(symbol, size, entry_price, exit_price, pnl, result)
-        adaptive_learning(symbol, pnl)
-        log(f"{symbol} trade result: {result}, PnL: {pnl}")
-
-    log("TitanBot trading session completed.")
+def cleanup_and_exit():
+    """Clean up resources and exit gracefully"""
+    global ib
+    
+    try:
+        log("Cleaning up and exiting...")
+        
+        # Cancel any pending orders
+        if ib and ib.isConnected():
+            try:
+                open_orders = ib.openOrders()
+                for order in open_orders:
+                    ib.cancelOrder(order)
+                    log(f"Cancelled order: {order}")
+            except Exception as e:
+                log(f"Error cancelling orders: {e}")
+            
+            # Disconnect from IB
+            ib.disconnect()
+            log("Disconnected from Interactive Brokers")
+        
+    except Exception as e:
+        log(f"Error during cleanup: {e}")
+    finally:
+        sys.exit(0)
 
 # === SCHEDULER ===
-schedule.every().monday.at("09:45").do(run_trading_day)
-schedule.every().tuesday.at("09:45").do(run_trading_day)
-schedule.every().wednesday.at("09:45").do(run_trading_day)
-schedule.every().thursday.at("09:45").do(run_trading_day)
-schedule.every().friday.at("09:45").do(run_trading_day)
+def init_scheduler():
+    """Initialize trading schedule"""
+    schedule.every().monday.at("09:45").do(run_trading_day)
+    schedule.every().tuesday.at("09:45").do(run_trading_day)
+    schedule.every().wednesday.at("09:45").do(run_trading_day)
+    schedule.every().thursday.at("09:45").do(run_trading_day)
+    schedule.every().friday.at("09:45").do(run_trading_day)
+    
+    log("Trading schedule initialized")
+
+def main():
+    """Main execution loop"""
+    global shutdown_flag
+    
+    try:
+        log("TitanBot-X initializing...")
+        
+        # Initial connection
+        if not connect_ib():
+            log("Failed to establish initial connection. Exiting.")
+            return
+        
+        # Initialize scheduler
+        init_scheduler()
+        
+        log("TitanBot-X initialized successfully. Waiting for scheduled trades...")
+        
+        # Main loop
+        while not shutdown_flag:
+            try:
+                schedule.run_pending()
+                time.sleep(10)
+                
+                # Health check
+                if ib and not ib.isConnected():
+                    log("Connection lost. Attempting to reconnect...")
+                    connect_ib()
+                    
+            except KeyboardInterrupt:
+                log("Keyboard interrupt received")
+                break
+            except Exception as e:
+                log(f"Error in main loop: {e}")
+                time.sleep(30)  # Wait before continuing
+                
+    except Exception as e:
+        log(f"Fatal error in main: {e}")
+        log(f"Traceback: {traceback.format_exc()}")
+    finally:
+        cleanup_and_exit()
 
 if __name__ == '__main__':
-    log("TitanBot initialized.")
-    while True:
-        schedule.run_pending()
-        time.sleep(10)
+    main()
