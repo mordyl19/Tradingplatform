@@ -12,17 +12,38 @@ import sys
 from datetime import datetime, timedelta
 import traceback
 import fcntl
+import pytz
+from scipy import stats
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+import talib
+import warnings
+warnings.filterwarnings('ignore')
 
 # === CONFIGURATION ===
 ACCOUNT_CASH_BUFFER = 0.05  # preserve 5% cash
 DAILY_LOSS_LIMIT = -0.05    # max -5% loss
-TRADE_SIZE_FRACTION = 0.2   # 20% per trade
-DEFAULT_HOLD_MINUTES = 90
-TRAIL_STOP_PCT = 0.03       # 3% trailing stop
+TRADE_SIZE_FRACTION = 0.15  # 15% per trade (reduced for better risk management)
+DEFAULT_HOLD_MINUTES = 60   # Reduced to 60 minutes
+TRAIL_STOP_PCT = 0.02       # 2% trailing stop (tighter)
 VOL_MULTIPLIER = 1.5        # volatility target multiplier
 MEMORY_FILE = "strategy_history.json"
 TRADE_LOG_FILE = "trade_log.csv"
 BOT_LOG_FILE = "titanbot.log"
+MARKET_DATA_CACHE = "market_cache.json"
+
+# Advanced strategy parameters
+RSI_PERIOD = 14
+RSI_OVERSOLD = 30
+RSI_OVERBOUGHT = 70
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+BB_PERIOD = 20
+BB_DEVIATION = 2
+VOLUME_SPIKE_THRESHOLD = 2.0
+ML_LOOKBACK_DAYS = 30
+CORRELATION_THRESHOLD = 0.7
 
 # Global variables
 ib = None
@@ -499,22 +520,50 @@ def live_exit(symbol, qty, entry_price):
         return entry_price
 
 # === CORE STRATEGY ===
-def is_market_open():
-    """Check if the market is currently open"""
+def is_market_holiday():
+    """Check if today is a market holiday"""
     try:
-        from datetime import datetime, time as dt_time
-        now = datetime.now()
+        # US market holidays (basic list - can be expanded)
+        holidays_2024 = [
+            "2024-01-01",  # New Year's Day
+            "2024-01-15",  # MLK Day
+            "2024-02-19",  # Presidents Day
+            "2024-03-29",  # Good Friday
+            "2024-05-27",  # Memorial Day
+            "2024-06-19",  # Juneteenth
+            "2024-07-04",  # Independence Day
+            "2024-09-02",  # Labor Day
+            "2024-11-28",  # Thanksgiving
+            "2024-12-25",  # Christmas
+        ]
+        
+        today = datetime.now().strftime("%Y-%m-%d")
+        return today in holidays_2024
+        
+    except Exception as e:
+        log(f"Error checking holidays: {e}")
+        return False
+
+def is_market_open():
+    """Check if the market is currently open with timezone awareness"""
+    try:
+        # Use Eastern Time for market hours
+        et = pytz.timezone('US/Eastern')
+        now_et = datetime.now(et)
         
         # Check if it's a weekday (Monday=0, Sunday=6)
-        if now.weekday() > 4:  # Saturday or Sunday
+        if now_et.weekday() > 4:  # Saturday or Sunday
+            return False
+        
+        # Check for holidays
+        if is_market_holiday():
             return False
         
         # Market hours: 9:30 AM to 4:00 PM EST
-        market_open = dt_time(9, 30)
-        market_close = dt_time(16, 0)
-        current_time = now.time()
+        market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
         
-        return market_open <= current_time <= market_close
+        return market_open <= now_et <= market_close
         
     except Exception as e:
         log(f"Error checking market hours: {e}")
