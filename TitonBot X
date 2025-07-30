@@ -179,39 +179,158 @@ def save_memory(memory):
     except Exception as e:
         log(f"Error saving memory: {e}")
 
-def adaptive_learning(symbol, pnl):
-    """Update strategy memory based on trade results"""
+def adaptive_learning(symbol, pnl_pct, trade_data=None):
+    """Enhanced adaptive learning with detailed performance tracking"""
     try:
         memory = load_memory()
         if symbol not in memory:
-            memory[symbol] = {"count": 0, "total_return": 0, "win_rate": 0.0, "wins": 0}
+            memory[symbol] = {
+                "count": 0,
+                "total_return": 0,
+                "win_rate": 0.0,
+                "wins": 0,
+                "losses": 0,
+                "avg_win": 0.0,
+                "avg_loss": 0.0,
+                "max_win": 0.0,
+                "max_loss": 0.0,
+                "profit_factor": 0.0,
+                "recent_performance": [],  # Last 10 trades
+                "signal_strength_avg": 0.0,
+                "last_trade_date": None,
+                "consecutive_wins": 0,
+                "consecutive_losses": 0,
+                "volatility_performance": {}
+            }
         
+        # Update basic metrics
         memory[symbol]["count"] += 1
-        memory[symbol]["total_return"] += pnl
+        memory[symbol]["total_return"] += pnl_pct
+        memory[symbol]["last_trade_date"] = datetime.now().isoformat()
         
-        if pnl > 0:
+        # Update win/loss tracking
+        if pnl_pct > 0:
             memory[symbol]["wins"] += 1
+            memory[symbol]["consecutive_wins"] += 1
+            memory[symbol]["consecutive_losses"] = 0
+            
+            # Update win statistics
+            total_wins = memory[symbol]["wins"]
+            prev_avg_win = memory[symbol]["avg_win"]
+            memory[symbol]["avg_win"] = ((prev_avg_win * (total_wins - 1)) + pnl_pct) / total_wins
+            memory[symbol]["max_win"] = max(memory[symbol]["max_win"], pnl_pct)
+        else:
+            memory[symbol]["losses"] += 1
+            memory[symbol]["consecutive_losses"] += 1
+            memory[symbol]["consecutive_wins"] = 0
+            
+            # Update loss statistics
+            total_losses = memory[symbol]["losses"]
+            prev_avg_loss = memory[symbol]["avg_loss"]
+            memory[symbol]["avg_loss"] = ((prev_avg_loss * (total_losses - 1)) + abs(pnl_pct)) / total_losses
+            memory[symbol]["max_loss"] = max(memory[symbol]["max_loss"], abs(pnl_pct))
         
+        # Calculate win rate
         memory[symbol]["win_rate"] = memory[symbol]["wins"] / memory[symbol]["count"]
+        
+        # Calculate profit factor (total wins / total losses)
+        total_win_amount = memory[symbol]["avg_win"] * memory[symbol]["wins"]
+        total_loss_amount = memory[symbol]["avg_loss"] * memory[symbol]["losses"]
+        if total_loss_amount > 0:
+            memory[symbol]["profit_factor"] = total_win_amount / total_loss_amount
+        
+        # Update recent performance (keep last 10 trades)
+        trade_record = {
+            "pnl_pct": pnl_pct,
+            "date": datetime.now().isoformat(),
+            "signal_strength": trade_data.get("signal_strength", 0) if trade_data else 0
+        }
+        memory[symbol]["recent_performance"].append(trade_record)
+        if len(memory[symbol]["recent_performance"]) > 10:
+            memory[symbol]["recent_performance"].pop(0)
+        
+        # Update signal strength average
+        if trade_data and "signal_strength" in trade_data:
+            current_avg = memory[symbol]["signal_strength_avg"]
+            count = memory[symbol]["count"]
+            memory[symbol]["signal_strength_avg"] = ((current_avg * (count - 1)) + trade_data["signal_strength"]) / count
+        
         save_memory(memory)
+        
+        # Log performance summary
+        log(f"{symbol} performance update:")
+        log(f"  Total trades: {memory[symbol]['count']}, Win rate: {memory[symbol]['win_rate']:.1%}")
+        log(f"  Avg win: {memory[symbol]['avg_win']:.2%}, Avg loss: {memory[symbol]['avg_loss']:.2%}")
+        log(f"  Profit factor: {memory[symbol]['profit_factor']:.2f}")
+        log(f"  Consecutive: {memory[symbol]['consecutive_wins']} wins, {memory[symbol]['consecutive_losses']} losses")
         
     except Exception as e:
         log(f"Error in adaptive learning: {e}")
 
 def evaluate_trade(symbol):
-    """Evaluate if we should trade this symbol based on historical performance"""
+    """Enhanced trade evaluation based on comprehensive performance metrics"""
     try:
         memory = load_memory()
         stats = memory.get(symbol, {"count": 0, "total_return": 0, "win_rate": 0.0})
         
-        # Skip if we have enough data and poor performance
-        if stats["count"] >= 5:
-            avg_return = stats["total_return"] / stats["count"]
-            win_rate = stats.get("win_rate", 0.0)
-            
-            if avg_return < -0.01 or win_rate < 0.3:  # Less than 30% win rate
-                log(f"Skipping {symbol} due to poor historical performance")
-                return False
+        # Allow trading if we don't have enough historical data
+        if stats["count"] < 5:
+            return True
+        
+        # Comprehensive performance evaluation
+        win_rate = stats.get("win_rate", 0.0)
+        avg_return = stats["total_return"] / stats["count"] if stats["count"] > 0 else 0
+        profit_factor = stats.get("profit_factor", 0.0)
+        consecutive_losses = stats.get("consecutive_losses", 0)
+        recent_performance = stats.get("recent_performance", [])
+        
+        # Calculate recent performance (last 5 trades)
+        recent_win_rate = 0.0
+        if len(recent_performance) >= 3:
+            recent_wins = sum(1 for trade in recent_performance[-5:] if trade["pnl_pct"] > 0)
+            recent_win_rate = recent_wins / min(5, len(recent_performance))
+        
+        # Evaluation criteria (more sophisticated)
+        reasons_to_skip = []
+        
+        # 1. Overall win rate too low
+        if win_rate < 0.35:  # Less than 35% win rate
+            reasons_to_skip.append(f"Low win rate: {win_rate:.1%}")
+        
+        # 2. Poor profit factor
+        if profit_factor > 0 and profit_factor < 1.1:  # Profit factor less than 1.1
+            reasons_to_skip.append(f"Poor profit factor: {profit_factor:.2f}")
+        
+        # 3. Too many consecutive losses
+        if consecutive_losses >= 3:
+            reasons_to_skip.append(f"Too many consecutive losses: {consecutive_losses}")
+        
+        # 4. Recent performance is very poor
+        if recent_win_rate < 0.2 and len(recent_performance) >= 5:
+            reasons_to_skip.append(f"Poor recent performance: {recent_win_rate:.1%}")
+        
+        # 5. Average return is significantly negative
+        if avg_return < -0.015:  # Average loss > 1.5%
+            reasons_to_skip.append(f"High average loss: {avg_return:.2%}")
+        
+        # Decision logic: Skip if multiple red flags
+        if len(reasons_to_skip) >= 2:
+            log(f"Skipping {symbol} due to poor performance: {', '.join(reasons_to_skip)}")
+            return False
+        
+        # Additional check: temporary cooldown after consecutive losses
+        if consecutive_losses >= 2:
+            last_trade_date = stats.get("last_trade_date")
+            if last_trade_date:
+                last_trade = datetime.fromisoformat(last_trade_date)
+                hours_since_last = (datetime.now() - last_trade).total_seconds() / 3600
+                if hours_since_last < 24:  # 24-hour cooldown
+                    log(f"Skipping {symbol} - cooldown period active ({hours_since_last:.1f}h since last trade)")
+                    return False
+        
+        # Log evaluation result
+        log(f"{symbol} evaluation passed - Win rate: {win_rate:.1%}, "
+            f"Profit factor: {profit_factor:.2f}, Recent: {recent_win_rate:.1%}")
         
         return True
         
@@ -321,31 +440,288 @@ def get_current_price(symbol):
         except:
             pass
 
-def get_signal(symbol):
-    """Generate trading signal with improved logic"""
+def calculate_technical_indicators(df):
+    """Calculate comprehensive technical indicators"""
     try:
-        df = get_market_data(symbol)
-        if df is None or len(df) < 20:
-            return False
+        if df is None or len(df) < 50:
+            return None
         
-        # Simple momentum strategy
-        current_price = df['close'].iloc[-1]
-        sma_10 = df['close'].rolling(10).mean().iloc[-1]
-        sma_20 = df['close'].rolling(20).mean().iloc[-1]
+        # Ensure we have enough data
+        close = df['close'].values
+        high = df['high'].values
+        low = df['low'].values
+        volume = df['volume'].values
         
-        # Volume confirmation
-        avg_volume = df['volume'].rolling(10).mean().iloc[-1]
+        indicators = {}
+        
+        # Moving Averages
+        indicators['sma_10'] = talib.SMA(close, timeperiod=10)
+        indicators['sma_20'] = talib.SMA(close, timeperiod=20)
+        indicators['sma_50'] = talib.SMA(close, timeperiod=50)
+        indicators['ema_12'] = talib.EMA(close, timeperiod=12)
+        indicators['ema_26'] = talib.EMA(close, timeperiod=26)
+        
+        # RSI
+        indicators['rsi'] = talib.RSI(close, timeperiod=RSI_PERIOD)
+        
+        # MACD
+        macd, macdsignal, macdhist = talib.MACD(close, fastperiod=MACD_FAST, 
+                                                slowperiod=MACD_SLOW, signalperiod=MACD_SIGNAL)
+        indicators['macd'] = macd
+        indicators['macd_signal'] = macdsignal
+        indicators['macd_histogram'] = macdhist
+        
+        # Bollinger Bands
+        bb_upper, bb_middle, bb_lower = talib.BBANDS(close, timeperiod=BB_PERIOD, 
+                                                     nbdevup=BB_DEVIATION, nbdevdn=BB_DEVIATION)
+        indicators['bb_upper'] = bb_upper
+        indicators['bb_middle'] = bb_middle
+        indicators['bb_lower'] = bb_lower
+        
+        # Volume indicators
+        indicators['volume_sma'] = talib.SMA(volume.astype(float), timeperiod=20)
+        
+        # ADX (Average Directional Index) for trend strength
+        indicators['adx'] = talib.ADX(high, low, close, timeperiod=14)
+        
+        # Stochastic Oscillator
+        slowk, slowd = talib.STOCH(high, low, close, fastk_period=14, slowk_period=3, slowd_period=3)
+        indicators['stoch_k'] = slowk
+        indicators['stoch_d'] = slowd
+        
+        # Williams %R
+        indicators['williams_r'] = talib.WILLR(high, low, close, timeperiod=14)
+        
+        # CCI (Commodity Channel Index)
+        indicators['cci'] = talib.CCI(high, low, close, timeperiod=14)
+        
+        return indicators
+        
+    except Exception as e:
+        log(f"Error calculating technical indicators: {e}")
+        return None
+
+def detect_market_regime(df, indicators):
+    """Detect current market regime (trending, sideways, volatile)"""
+    try:
+        if indicators is None:
+            return "unknown"
+        
+        # Get latest values
+        adx_current = indicators['adx'][-1] if not np.isnan(indicators['adx'][-1]) else 0
+        bb_width = (indicators['bb_upper'][-1] - indicators['bb_lower'][-1]) / indicators['bb_middle'][-1]
+        
+        # Calculate price volatility
+        returns = df['close'].pct_change().dropna()
+        volatility = returns.std() * np.sqrt(252)  # Annualized volatility
+        
+        # Regime detection logic
+        if adx_current > 25 and bb_width > 0.1:
+            return "trending"
+        elif adx_current < 20 and bb_width < 0.05:
+            return "sideways"
+        elif volatility > 0.3:
+            return "volatile"
+        else:
+            return "neutral"
+            
+    except Exception as e:
+        log(f"Error detecting market regime: {e}")
+        return "unknown"
+
+def calculate_signal_strength(df, indicators, symbol):
+    """Calculate comprehensive signal strength score (0-100)"""
+    try:
+        if indicators is None or len(df) < 50:
+            return 0
+        
+        score = 0
+        confirmations = 0
+        
+        # Get latest values
+        close = df['close'].iloc[-1]
+        prev_close = df['close'].iloc[-2]
+        
+        # 1. Trend Analysis (25 points)
+        if not np.isnan(indicators['sma_10'][-1]) and not np.isnan(indicators['sma_20'][-1]):
+            if close > indicators['sma_10'][-1] > indicators['sma_20'][-1] > indicators['sma_50'][-1]:
+                score += 25
+                confirmations += 1
+            elif close > indicators['sma_10'][-1] > indicators['sma_20'][-1]:
+                score += 15
+            elif close > indicators['sma_10'][-1]:
+                score += 8
+        
+        # 2. RSI Analysis (15 points)
+        rsi_current = indicators['rsi'][-1]
+        if not np.isnan(rsi_current):
+            if 40 <= rsi_current <= 70:  # Goldilocks zone
+                score += 15
+                confirmations += 1
+            elif 30 <= rsi_current <= 80:
+                score += 10
+            elif rsi_current < 30:  # Oversold - potential reversal
+                score += 5
+        
+        # 3. MACD Analysis (15 points)
+        macd_current = indicators['macd'][-1]
+        macd_signal = indicators['macd_signal'][-1]
+        macd_hist = indicators['macd_histogram'][-1]
+        
+        if not np.isnan(macd_current) and not np.isnan(macd_signal):
+            if macd_current > macd_signal and macd_hist > 0:
+                score += 15
+                confirmations += 1
+            elif macd_current > macd_signal:
+                score += 10
+        
+        # 4. Bollinger Bands Analysis (15 points)
+        bb_position = (close - indicators['bb_lower'][-1]) / (indicators['bb_upper'][-1] - indicators['bb_lower'][-1])
+        if 0.2 <= bb_position <= 0.8:  # Not at extremes
+            score += 15
+            confirmations += 1
+        elif bb_position < 0.2:  # Near lower band - potential bounce
+            score += 8
+        
+        # 5. Volume Analysis (10 points)
         current_volume = df['volume'].iloc[-1]
+        avg_volume = indicators['volume_sma'][-1]
+        if current_volume > avg_volume * 1.5:
+            score += 10
+            confirmations += 1
+        elif current_volume > avg_volume * 1.2:
+            score += 6
         
-        # Signal conditions
-        momentum_signal = current_price > sma_10 > sma_20
-        volume_confirmation = current_volume > avg_volume * 1.2
+        # 6. Momentum Analysis (10 points)
+        if close > prev_close:
+            price_momentum = (close - prev_close) / prev_close
+            if price_momentum > 0.01:  # > 1% gain
+                score += 10
+                confirmations += 1
+            elif price_momentum > 0.005:  # > 0.5% gain
+                score += 6
         
-        return momentum_signal and volume_confirmation
+        # 7. ADX Trend Strength (10 points)
+        adx_current = indicators['adx'][-1]
+        if not np.isnan(adx_current) and adx_current > 25:
+            score += 10
+            confirmations += 1
+        elif not np.isnan(adx_current) and adx_current > 20:
+            score += 6
+        
+        # Penalty for conflicting signals
+        if confirmations < 3:
+            score *= 0.7  # Reduce score if not enough confirmations
+        
+        # Market regime adjustment
+        regime = detect_market_regime(df, indicators)
+        if regime == "trending":
+            score *= 1.1  # Boost for trending markets
+        elif regime == "sideways":
+            score *= 0.8  # Reduce for sideways markets
+        elif regime == "volatile":
+            score *= 0.6  # Significant reduction for volatile markets
+        
+        log(f"{symbol} signal strength: {score:.1f} (confirmations: {confirmations}, regime: {regime})")
+        return min(100, max(0, score))
+        
+    except Exception as e:
+        log(f"Error calculating signal strength for {symbol}: {e}")
+        return 0
+
+def get_multi_timeframe_data(symbol):
+    """Get data from multiple timeframes for confirmation"""
+    try:
+        if not ib or not ib.isConnected():
+            return None, None
+        
+        contract = Stock(symbol, 'SMART', 'USD')
+        ib.qualifyContracts(contract)
+        
+        # Get 15-minute data for short-term analysis
+        bars_15m = ib.reqHistoricalData(
+            contract,
+            endDateTime='',
+            durationStr='3 D',
+            barSizeSetting='15 mins',
+            whatToShow='TRADES',
+            useRTH=True,
+            formatDate=1
+        )
+        
+        # Get hourly data for medium-term trend
+        bars_1h = ib.reqHistoricalData(
+            contract,
+            endDateTime='',
+            durationStr='10 D',
+            barSizeSetting='1 hour',
+            whatToShow='TRADES',
+            useRTH=True,
+            formatDate=1
+        )
+        
+        df_15m = util.df(bars_15m) if bars_15m else None
+        df_1h = util.df(bars_1h) if bars_1h else None
+        
+        return df_15m, df_1h
+        
+    except Exception as e:
+        log(f"Error getting multi-timeframe data for {symbol}: {e}")
+        return None, None
+
+def get_signal(symbol):
+    """Generate sophisticated trading signal with multiple confirmations"""
+    try:
+        # Get primary 5-minute data
+        df = get_market_data(symbol)
+        if df is None or len(df) < 50:
+            return False, 0
+        
+        # Get multi-timeframe data
+        df_15m, df_1h = get_multi_timeframe_data(symbol)
+        
+        # Calculate technical indicators
+        indicators = calculate_technical_indicators(df)
+        if indicators is None:
+            return False, 0
+        
+        # Calculate signal strength
+        signal_strength = calculate_signal_strength(df, indicators, symbol)
+        
+        # Multi-timeframe confirmation
+        timeframe_score = 0
+        if df_15m is not None and len(df_15m) >= 20:
+            indicators_15m = calculate_technical_indicators(df_15m)
+            if indicators_15m is not None:
+                tf_strength = calculate_signal_strength(df_15m, indicators_15m, f"{symbol}_15m")
+                if tf_strength > 60:
+                    timeframe_score += 15
+                elif tf_strength > 40:
+                    timeframe_score += 8
+        
+        if df_1h is not None and len(df_1h) >= 20:
+            indicators_1h = calculate_technical_indicators(df_1h)
+            if indicators_1h is not None:
+                tf_strength = calculate_signal_strength(df_1h, indicators_1h, f"{symbol}_1h")
+                if tf_strength > 60:
+                    timeframe_score += 10
+                elif tf_strength > 40:
+                    timeframe_score += 5
+        
+        # Final signal strength with timeframe confirmation
+        final_strength = signal_strength + timeframe_score
+        
+        # Minimum threshold for signal (conservative approach)
+        signal_threshold = 70  # High threshold for better win rate
+        
+        signal = final_strength >= signal_threshold
+        log(f"{symbol} final signal: {signal} (strength: {final_strength:.1f})")
+        
+        return signal, final_strength
         
     except Exception as e:
         log(f"Error generating signal for {symbol}: {e}")
-        return False
+        return False, 0
 
 # === TRADE EXECUTION ===
 def get_buying_power():
@@ -367,42 +743,86 @@ def get_buying_power():
         log(f"Error getting buying power: {e}")
         return 0.0
 
-def calculate_position_size(symbol, balance):
-    """Calculate appropriate position size with comprehensive validation"""
+def calculate_volatility_adjusted_size(symbol, base_size, current_price):
+    """Adjust position size based on volatility"""
+    try:
+        df = get_market_data(symbol)
+        if df is None or len(df) < 20:
+            return base_size
+        
+        # Calculate 20-day volatility
+        returns = df['close'].pct_change().dropna()
+        volatility = returns.tail(20).std()
+        
+        # Adjust based on volatility (reduce size for high volatility)
+        if volatility > 0.03:  # High volatility (>3% daily)
+            adjustment = 0.5
+        elif volatility > 0.02:  # Medium volatility (2-3% daily)
+            adjustment = 0.7
+        elif volatility > 0.01:  # Low volatility (1-2% daily)
+            adjustment = 0.9
+        else:  # Very low volatility (<1% daily)
+            adjustment = 1.0
+        
+        adjusted_size = int(base_size * adjustment)
+        log(f"{symbol} volatility adjustment: {volatility:.3f} -> size multiplier: {adjustment}")
+        
+        return adjusted_size
+        
+    except Exception as e:
+        log(f"Error calculating volatility adjustment for {symbol}: {e}")
+        return base_size
+
+def calculate_position_size(symbol, balance, signal_strength=50):
+    """Calculate adaptive position size based on signal strength and risk factors"""
     try:
         current_price = get_current_price(symbol)
         if not current_price or current_price <= 0:
             log(f"Invalid current price for {symbol}: {current_price}")
             return 0
         
-        # Calculate trade value based on balance
-        trade_value = balance * TRADE_SIZE_FRACTION
+        # Base trade fraction adjusted by signal strength
+        strength_multiplier = min(1.5, signal_strength / 70)  # Scale based on signal strength
+        adjusted_fraction = TRADE_SIZE_FRACTION * strength_multiplier
         
-        # Calculate number of shares
-        shares = int(trade_value / current_price)
+        # Calculate base trade value
+        trade_value = balance * adjusted_fraction
         
-        # Get buying power and available funds
+        # Base number of shares
+        base_shares = int(trade_value / current_price)
+        
+        # Apply volatility adjustment
+        vol_adjusted_shares = calculate_volatility_adjusted_size(symbol, base_shares, current_price)
+        
+        # Get account limits
         buying_power = get_buying_power()
         available_funds = get_available_funds()
         
         # Apply conservative limits
         max_shares_by_funds = int((available_funds * (1 - ACCOUNT_CASH_BUFFER)) / current_price)
-        max_shares_by_power = int((buying_power * 0.8) / current_price)  # Use 80% of buying power
+        max_shares_by_power = int((buying_power * 0.8) / current_price)
+        
+        # Portfolio concentration limit (reduce from 25% to 20% for better diversification)
+        max_position_value = balance * 0.20
+        max_shares_by_concentration = int(max_position_value / current_price)
         
         # Take the most conservative limit
-        final_shares = min(shares, max_shares_by_funds, max_shares_by_power)
+        final_shares = min(vol_adjusted_shares, max_shares_by_funds, max_shares_by_power, max_shares_by_concentration)
         
         # Minimum position validation
-        if final_shares <= 0:
-            log(f"Position size too small for {symbol}: {final_shares} shares")
+        min_trade_value = 100  # Minimum $100 trade
+        min_shares = max(1, int(min_trade_value / current_price))
+        
+        if final_shares < min_shares:
+            log(f"Position size too small for {symbol}: {final_shares} shares (min: {min_shares})")
             return 0
         
-        # Maximum position validation (no more than 25% in single stock)
-        max_position_value = balance * 0.25
-        max_shares_by_concentration = int(max_position_value / current_price)
-        final_shares = min(final_shares, max_shares_by_concentration)
+        # Calculate final trade value
+        final_trade_value = final_shares * current_price
         
-        log(f"Position size for {symbol}: {final_shares} shares (${final_shares * current_price:.2f})")
+        log(f"{symbol} adaptive position: {final_shares} shares (${final_trade_value:.2f}) - "
+            f"Signal: {signal_strength:.1f}, Strength mult: {strength_multiplier:.2f}")
+        
         return final_shares
         
     except Exception as e:
@@ -451,8 +871,56 @@ def place_order(symbol, qty):
         log(f"Error placing order for {symbol}: {e}")
         return None
 
-def live_exit(symbol, qty, entry_price):
-    """Execute exit strategy with trailing stop and time limit"""
+def calculate_dynamic_stops(symbol, entry_price, signal_strength):
+    """Calculate dynamic stop-loss and take-profit levels"""
+    try:
+        df = get_market_data(symbol)
+        if df is None:
+            # Fallback to static values
+            return entry_price * 0.98, entry_price * 1.04
+        
+        # Calculate ATR (Average True Range) for volatility-based stops
+        high = df['high'].values
+        low = df['low'].values
+        close = df['close'].values
+        
+        atr = talib.ATR(high, low, close, timeperiod=14)
+        current_atr = atr[-1] if not np.isnan(atr[-1]) else 0.02 * entry_price
+        
+        # Base stop-loss and take-profit multipliers
+        base_stop_multiplier = 1.5  # 1.5x ATR for stop-loss
+        base_profit_multiplier = 3.0  # 3x ATR for take-profit (2:1 reward:risk)
+        
+        # Adjust based on signal strength
+        strength_factor = signal_strength / 100
+        stop_multiplier = base_stop_multiplier * (1.5 - strength_factor)  # Tighter stops for weaker signals
+        profit_multiplier = base_profit_multiplier * (0.5 + strength_factor)  # Higher targets for stronger signals
+        
+        # Calculate levels
+        stop_loss = entry_price - (current_atr * stop_multiplier)
+        take_profit = entry_price + (current_atr * profit_multiplier)
+        
+        # Ensure minimum and maximum limits
+        min_stop_pct = 0.015  # Minimum 1.5% stop-loss
+        max_stop_pct = 0.04   # Maximum 4% stop-loss
+        min_profit_pct = 0.02 # Minimum 2% take-profit
+        
+        stop_loss = max(stop_loss, entry_price * (1 - max_stop_pct))
+        stop_loss = min(stop_loss, entry_price * (1 - min_stop_pct))
+        take_profit = max(take_profit, entry_price * (1 + min_profit_pct))
+        
+        log(f"{symbol} dynamic stops - Entry: {entry_price:.2f}, Stop: {stop_loss:.2f} "
+            f"({((entry_price - stop_loss) / entry_price * 100):.1f}%), "
+            f"Target: {take_profit:.2f} ({((take_profit - entry_price) / entry_price * 100):.1f}%)")
+        
+        return stop_loss, take_profit
+        
+    except Exception as e:
+        log(f"Error calculating dynamic stops for {symbol}: {e}")
+        return entry_price * 0.98, entry_price * 1.04
+
+def live_exit(symbol, qty, entry_price, signal_strength=50):
+    """Execute sophisticated exit strategy with dynamic stops and multiple exit conditions"""
     try:
         if not ib or not ib.isConnected():
             return entry_price
@@ -460,41 +928,79 @@ def live_exit(symbol, qty, entry_price):
         contract = Stock(symbol, 'SMART', 'USD')
         ib.qualifyContracts(contract)
         
+        # Calculate dynamic stop-loss and take-profit levels
+        initial_stop_loss, take_profit = calculate_dynamic_stops(symbol, entry_price, signal_strength)
+        
         max_price = entry_price
+        trailing_stop = initial_stop_loss
         start_time = time.time()
         hold_seconds = DEFAULT_HOLD_MINUTES * 60
+        last_price_check = time.time()
         
-        # Get volatility for dynamic exit
-        df = get_market_data(symbol)
-        vol = calculate_volatility(df)
-        
-        log(f"Starting exit monitoring for {symbol}, entry: {entry_price}")
+        log(f"Starting advanced exit monitoring for {symbol}")
+        log(f"Entry: {entry_price:.2f}, Initial Stop: {initial_stop_loss:.2f}, Target: {take_profit:.2f}")
         
         while time.time() - start_time < hold_seconds:
             if shutdown_flag:
                 break
+            
+            # Check price every 3 seconds to reduce API calls
+            if time.time() - last_price_check < 3:
+                ib.sleep(1)
+                continue
                 
             current_price = get_current_price(symbol)
             if not current_price:
                 ib.sleep(5)
                 continue
-            
-            max_price = max(max_price, current_price)
-            drawdown = (max_price - current_price) / max_price if max_price > 0 else 0
-            profit_pct = (current_price - entry_price) / entry_price if entry_price > 0 else 0
-            
-            # Exit conditions
-            if drawdown >= TRAIL_STOP_PCT:
-                log(f"Trailing stop triggered for {symbol}: {drawdown:.2%} drawdown")
-                break
                 
-            if vol > 0 and profit_pct >= VOL_MULTIPLIER * vol:
-                log(f"Profit target reached for {symbol}: {profit_pct:.2%}")
+            last_price_check = time.time()
+            
+            # Update max price and trailing stop
+            if current_price > max_price:
+                max_price = current_price
+                
+                # Update trailing stop (only move up, never down)
+                new_trailing_stop = max_price * (1 - TRAIL_STOP_PCT)
+                trailing_stop = max(trailing_stop, new_trailing_stop)
+            
+            # Calculate current profit/loss
+            profit_pct = (current_price - entry_price) / entry_price
+            unrealized_pnl = (current_price - entry_price) * qty
+            
+            # Exit condition 1: Take profit target reached
+            if current_price >= take_profit:
+                log(f"Take profit target reached for {symbol}: {current_price:.2f} >= {take_profit:.2f}")
                 break
             
-            ib.sleep(5)
+            # Exit condition 2: Stop loss hit
+            if current_price <= trailing_stop:
+                log(f"Trailing stop triggered for {symbol}: {current_price:.2f} <= {trailing_stop:.2f}")
+                break
+            
+            # Exit condition 3: Large sudden drop (flash crash protection)
+            if profit_pct < -0.03:  # 3% loss threshold
+                log(f"Large loss threshold triggered for {symbol}: {profit_pct:.2%}")
+                break
+            
+            # Exit condition 4: Time-based exit with profit check
+            time_elapsed = (time.time() - start_time) / 60  # minutes
+            if time_elapsed > DEFAULT_HOLD_MINUTES * 0.8:  # 80% of max hold time
+                # If we have some profit, take it
+                if profit_pct > 0.005:  # > 0.5% profit
+                    log(f"Time-based exit with profit for {symbol}: {profit_pct:.2%}")
+                    break
+            
+            # Periodic logging
+            if int(time_elapsed) % 10 == 0 and time_elapsed > 0:
+                log(f"{symbol} monitoring - Price: {current_price:.2f}, "
+                    f"P&L: {profit_pct:.2%} (${unrealized_pnl:.2f}), "
+                    f"Time: {time_elapsed:.1f}m")
+            
+            ib.sleep(2)
         
-        # Place sell order
+        # Execute sell order
+        log(f"Executing sell order for {symbol}")
         sell_order = MarketOrder('SELL', qty)
         sell_trade = ib.placeOrder(contract, sell_order)
         
@@ -509,7 +1015,10 @@ def live_exit(symbol, qty, entry_price):
         
         if sell_trade.orderStatus.status == 'Filled':
             exit_price = sell_trade.orderStatus.avgFillPrice
-            log(f"Successfully sold {qty} shares of {symbol} at {exit_price}")
+            final_pnl = (exit_price - entry_price) * qty
+            final_pct = (exit_price - entry_price) / entry_price
+            log(f"Successfully sold {qty} shares of {symbol} at {exit_price:.2f}")
+            log(f"Final P&L: ${final_pnl:.2f} ({final_pct:.2%})")
             return exit_price
         else:
             log(f"Sell order for {symbol} not filled: {sell_trade.orderStatus.status}")
@@ -627,19 +1136,27 @@ def run_trading_day():
                 
             try:
                 # Check if we should trade this symbol
-                if not get_signal(symbol):
-                    log(f"No signal for {symbol}")
+                signal, signal_strength = get_signal(symbol)
+                if not signal:
+                    log(f"No signal for {symbol} (strength: {signal_strength:.1f})")
                     continue
                     
                 if not evaluate_trade(symbol):
                     log(f"Skipping {symbol} based on historical performance")
                     continue
                 
-                # Calculate position size
-                qty = calculate_position_size(symbol, balance)
+                # Calculate adaptive position size based on signal strength
+                qty = calculate_position_size(symbol, balance, signal_strength)
                 if qty <= 0:
                     log(f"Invalid position size for {symbol}: {qty}")
                     continue
+                
+                # Additional risk check - don't trade if signal strength is too low even after passing threshold
+                if signal_strength < 75:
+                    log(f"Signal strength too low for safe trading: {symbol} ({signal_strength:.1f})")
+                    continue
+                
+                log(f"Executing trade for {symbol} - Signal strength: {signal_strength:.1f}, Quantity: {qty}")
                 
                 # Place entry order
                 trade = place_order(symbol, qty)
@@ -651,8 +1168,20 @@ def run_trading_day():
                     log(f"Invalid entry price for {symbol}: {entry_price}")
                     continue
                 
-                # Execute exit strategy
-                exit_price = live_exit(symbol, qty, entry_price)
+                # Store position for tracking
+                active_positions[symbol] = {
+                    'qty': qty,
+                    'entry_price': entry_price,
+                    'entry_time': datetime.now(),
+                    'signal_strength': signal_strength
+                }
+                
+                # Execute sophisticated exit strategy
+                exit_price = live_exit(symbol, qty, entry_price, signal_strength)
+                
+                # Remove from active positions
+                if symbol in active_positions:
+                    del active_positions[symbol]
                 
                 # Calculate results
                 pnl = (exit_price - entry_price) * qty
@@ -663,17 +1192,32 @@ def run_trading_day():
                 daily_pnl += pnl
                 trades_executed += 1
                 
-                # Record trade
+                # Record trade with additional metrics
                 record_trade(symbol, qty, entry_price, exit_price, pnl, result)
-                adaptive_learning(symbol, pnl_pct)
                 
-                log(f"{symbol} trade completed: {result}, PnL: ${pnl:.2f} ({pnl_pct:.2%})")
+                # Enhanced adaptive learning with trade data
+                trade_data = {
+                    'signal_strength': signal_strength,
+                    'entry_price': entry_price,
+                    'exit_price': exit_price,
+                    'quantity': qty,
+                    'result': result
+                }
+                adaptive_learning(symbol, pnl_pct, trade_data)
+                
+                # Log comprehensive trade summary
+                log(f"{symbol} trade completed: {result}")
+                log(f"  Entry: ${entry_price:.2f}, Exit: ${exit_price:.2f}")
+                log(f"  P&L: ${pnl:.2f} ({pnl_pct:.2%})")
+                log(f"  Signal Strength: {signal_strength:.1f}")
+                log(f"  Quantity: {qty} shares")
                 
                 # Brief pause between trades
-                time.sleep(10)
+                time.sleep(15)  # Increased pause for better execution
                 
             except Exception as e:
                 log(f"Error trading {symbol}: {e}")
+                log(f"Traceback: {traceback.format_exc()}")
                 continue
         
         # Session summary
