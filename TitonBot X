@@ -1,0 +1,172 @@
+# === TitanBot-X: Fully Autonomous Adaptive Trading Bot for Interactive Brokers ===
+
+from ib_insync import *
+import pandas as pd
+import numpy as np
+import schedule
+import time
+import json
+import os
+from datetime import datetime
+
+# === CONFIGURATION ===
+ACCOUNT_CASH_BUFFER = 0.05  # preserve 5% cash
+DAILY_LOSS_LIMIT = -0.05    # max -5% loss
+TRADE_SIZE_FRACTION = 0.2   # 20% per trade
+DEFAULT_HOLD_MINUTES = 90
+TRAIL_STOP_PCT = 0.03       # 3% trailing stop
+VOL_MULTIPLIER = 1.5        # volatility target multiplier
+MEMORY_FILE = "strategy_history.json"
+TRADE_LOG_FILE = "trade_log.csv"
+
+# === CONNECT TO IB ===
+ib = IB()
+ib.connect('127.0.0.1', 7497, clientId=1)
+
+# === HELPER FUNCTIONS ===
+def log(msg):
+    with open("titanbot.log", "a") as f:
+        f.write(f"[{datetime.now()}] {msg}\n")
+    print(msg)
+
+def get_account_balance():
+    account_summary = ib.accountSummary()
+    net_liquidation = float(account_summary.loc['NetLiquidation', 'value'])
+    return net_liquidation
+
+def load_memory():
+    if os.path.exists(MEMORY_FILE):
+        with open(MEMORY_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_memory(memory):
+    with open(MEMORY_FILE, 'w') as f:
+        json.dump(memory, f, indent=2)
+
+def adaptive_learning(symbol, pnl):
+    memory = load_memory()
+    if symbol not in memory:
+        memory[symbol] = {"count": 0, "total_return": 0}
+    memory[symbol]["count"] += 1
+    memory[symbol]["total_return"] += pnl
+    save_memory(memory)
+
+def evaluate_trade(symbol):
+    memory = load_memory()
+    stats = memory.get(symbol, {"count": 0, "total_return": 0})
+    if stats["count"] >= 3 and (stats["total_return"] / stats["count"]) < 0:
+        return False
+    return True
+
+def record_trade(symbol, qty, entry, exit, pnl, result):
+    with open(TRADE_LOG_FILE, 'a') as f:
+        f.write(f"{datetime.now()},{symbol},{qty},{entry},{exit},{pnl},{result}\n")
+
+# === MARKET FUNCTIONS ===
+def get_market_data(symbol):
+    contract = Stock(symbol, 'SMART', 'USD')
+    ib.qualifyContracts(contract)
+    bars = ib.reqHistoricalData(
+        contract,
+        endDateTime='',
+        durationStr='5 D',
+        barSizeSetting='5 mins',
+        whatToShow='TRADES',
+        useRTH=True,
+        formatDate=1
+    )
+    df = util.df(bars)
+    return df
+
+def calculate_volatility(df):
+    return df['close'].pct_change().std()
+
+def get_signal(symbol):
+    df = get_market_data(symbol)
+    if df is None or len(df) < 10:
+        return False
+    momentum = df['close'].iloc[-1] > df['close'].rolling(10).mean().iloc[-1]
+    return momentum
+
+# === TRADE EXECUTION ===
+def place_order(symbol, qty):
+    contract = Stock(symbol, 'SMART', 'USD')
+    ib.qualifyContracts(contract)
+    order = MarketOrder('BUY', qty)
+    trade = ib.placeOrder(contract, order)
+    ib.sleep(5)
+    return trade
+
+def live_exit(symbol, qty, entry_price):
+    contract = Stock(symbol, 'SMART', 'USD')
+    ib.qualifyContracts(contract)
+    max_price = entry_price
+    start_time = time.time()
+    hold_seconds = DEFAULT_HOLD_MINUTES * 60
+    df = get_market_data(symbol)
+    vol = calculate_volatility(df)
+    exit_price = entry_price
+
+    while time.time() - start_time < hold_seconds:
+        ticker = ib.reqMktData(contract, '', False, False)
+        ib.sleep(5)
+        current_price = ticker.marketPrice()
+        max_price = max(max_price, current_price)
+        drawdown = (max_price - current_price) / max_price
+        price_change = (current_price - entry_price)
+        exit_price = current_price
+
+        if drawdown >= TRAIL_STOP_PCT:
+            break
+        if price_change >= VOL_MULTIPLIER * vol * entry_price:
+            break
+
+    sell_order = MarketOrder('SELL', qty)
+    ib.placeOrder(contract, sell_order)
+    ib.sleep(3)
+    return exit_price
+
+# === CORE STRATEGY ===
+def run_trading_day():
+    log("Starting TitanBot trading session...")
+    balance = get_account_balance()
+    if balance <= 0:
+        log("No available balance.")
+        return
+
+    tickers = ["SPY", "QQQ", "TQQQ", "TSLA", "NVDA"]
+    for symbol in tickers:
+        if not get_signal(symbol):
+            continue
+        if not evaluate_trade(symbol):
+            continue
+
+        size = int((balance * TRADE_SIZE_FRACTION) // 100)
+        trade = place_order(symbol, size)
+        entry_price = trade.orderStatus.avgFillPrice or 0
+        if entry_price <= 0:
+            log(f"Failed entry price for {symbol}.")
+            continue
+
+        exit_price = live_exit(symbol, size, entry_price)
+        pnl = exit_price - entry_price
+        result = "win" if pnl > 0 else "loss"
+        record_trade(symbol, size, entry_price, exit_price, pnl, result)
+        adaptive_learning(symbol, pnl)
+        log(f"{symbol} trade result: {result}, PnL: {pnl}")
+
+    log("TitanBot trading session completed.")
+
+# === SCHEDULER ===
+schedule.every().monday.at("09:45").do(run_trading_day)
+schedule.every().tuesday.at("09:45").do(run_trading_day)
+schedule.every().wednesday.at("09:45").do(run_trading_day)
+schedule.every().thursday.at("09:45").do(run_trading_day)
+schedule.every().friday.at("09:45").do(run_trading_day)
+
+if __name__ == '__main__':
+    log("TitanBot initialized.")
+    while True:
+        schedule.run_pending()
+        time.sleep(10)
